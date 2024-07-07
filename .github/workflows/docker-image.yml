@@ -21,7 +21,7 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Build the Docker image
-        run: docker build -t sakthi19/fastapi-backend:latest .
+        run: docker build -t sakthi1946/fastapi-backend:latest .
 
       - name: Push to Docker Hub
-        run: docker push sakthi19/fastapi-backend:latest
+        run: docker push sakthi1946/fastapi-backend:latest
