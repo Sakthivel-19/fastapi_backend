@@ -22,3 +22,7 @@ def read_root():
 @app.get("/testing")
 def read_root():
     return {"Hello": "Testing World"}
+
+@app.get("/ansible")
+def read_root():
+    return {"Ansible": "Deployment using Ansible done successfully"}
