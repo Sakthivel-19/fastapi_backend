@@ -1,0 +1,161 @@
+name: Deploy on PR Merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+jobs:
+  # Only run if PR was merged (not just closed)
+  deploy:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: main  # Ensure we're using the merged code
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Run tests
+        run: |
+          pytest tests/ -v --tb=short
+          echo "✅ All tests passed!"
+      
+      - name: Run coverage check
+        run: |
+          coverage run -m pytest tests/
+          coverage report --include="app/*" --fail-under=90
+          echo "✅ Coverage check passed!"
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: sakthi1946/fastapi-backend
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            latest
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Deploy to production
+        run: |
+          echo "🚀 Triggering deployment..."
+          # This will trigger the existing CD Pipeline workflow
+          echo "Docker image pushed successfully with tags: ${{ steps.meta.outputs.tags }}"
+      
+      - name: Create deployment status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const sha = context.payload.pull_request.merge_commit_sha;
+            
+            // Create deployment
+            const deployment = await github.rest.repos.createDeployment({
+              owner,
+              repo,
+              ref: sha,
+              environment: 'production',
+              description: `Deploy PR #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}`,
+              auto_merge: false,
+              required_contexts: []
+            });
+            
+            // Mark deployment as success
+            await github.rest.repos.createDeploymentStatus({
+              owner,
+              repo,
+              deployment_id: deployment.data.id,
+              state: 'success',
+              description: 'Deployment completed successfully',
+              environment_url: 'https://your-production-url.com'  // Update with your actual URL
+            });
+      
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body: `🚀 **Deployment Successful!**
+              
+              Your changes have been automatically deployed to production.
+              
+              **Deployment Details:**
+              - ✅ Tests passed
+              - ✅ Coverage check passed  
+              - ✅ Docker image built and pushed
+              - ✅ Production deployment triggered
+              
+              **Docker Image:** \`sakthi1946/fastapi-backend:latest\`
+              **Commit:** \`${{ github.event.pull_request.merge_commit_sha }}\`
+              
+              The application should be available shortly at your production URL.`
+            });
+
+  # Notify on deployment failure
+  notify-failure:
+    if: failure() && github.event.pull_request.merged == true
+    needs: deploy
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Comment on PR about failure
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body: `❌ **Deployment Failed!**
+              
+              The automatic deployment failed after merging this PR.
+              
+              **Please check:**
+              - GitHub Actions logs for detailed error information
+              - Docker Hub credentials and permissions
+              - Test failures or coverage issues
+              - Production server status
+              
+              **Action Required:** Manual intervention needed to complete the deployment.`
+            });

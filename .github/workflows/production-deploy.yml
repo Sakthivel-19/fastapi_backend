@@ -1,0 +1,187 @@
+name: Production Deployment
+
+on:
+  workflow_run:
+    workflows: ["Deploy on PR Merge"]
+    types:
+      - completed
+  # Also allow manual triggering
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker image tag to deploy'
+        required: false
+        default: 'latest'
+
+jobs:
+  deploy-to-production:
+    # Only run if the triggering workflow succeeded
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: self-hosted
+    
+    environment:
+      name: production
+      url: http://your-production-url.com  # Update with your actual URL
+    
+    steps:
+      - name: Set image tag
+        id: set-tag
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "IMAGE_TAG=${{ github.event.inputs.image_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "IMAGE_TAG=latest" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Check Docker service
+        run: |
+          sudo systemctl status docker || sudo systemctl start docker
+          echo "✅ Docker service is running"
+      
+      - name: Pull latest Docker image
+        run: |
+          echo "🔄 Pulling Docker image: sakthi1946/fastapi-backend:${{ steps.set-tag.outputs.IMAGE_TAG }}"
+          sudo docker pull sakthi1946/fastapi-backend:${{ steps.set-tag.outputs.IMAGE_TAG }}
+          echo "✅ Docker image pulled successfully"
+      
+      - name: Stop and remove old container
+        run: |
+          echo "🛑 Stopping old container..."
+          sudo docker stop fastapi-backend-container || true
+          sudo docker rm fastapi-backend-container || true
+          echo "✅ Old container removed"
+      
+      - name: Run health check on new image
+        run: |
+          echo "🔍 Running health check..."
+          # Start container temporarily for health check
+          sudo docker run -d --name fastapi-backend-healthcheck -p 8001:8000 sakthi1946/fastapi-backend:${{ steps.set-tag.outputs.IMAGE_TAG }}
+          
+          # Wait for container to start
+          sleep 10
+          
+          # Check if the application is responding
+          if curl -f http://localhost:8001/ > /dev/null 2>&1; then
+            echo "✅ Health check passed"
+            sudo docker stop fastapi-backend-healthcheck
+            sudo docker rm fastapi-backend-healthcheck
+          else
+            echo "❌ Health check failed"
+            sudo docker logs fastapi-backend-healthcheck
+            sudo docker stop fastapi-backend-healthcheck
+            sudo docker rm fastapi-backend-healthcheck
+            exit 1
+          fi
+      
+      - name: Deploy new container
+        run: |
+          echo "🚀 Deploying new container..."
+          sudo docker run -d \
+            -p 8000:8000 \
+            --name fastapi-backend-container \
+            --restart unless-stopped \
+            --memory="512m" \
+            --cpus="1.0" \
+            -e ENVIRONMENT=production \
+            sakthi1946/fastapi-backend:${{ steps.set-tag.outputs.IMAGE_TAG }}
+          
+          echo "✅ New container deployed successfully"
+      
+      - name: Verify deployment
+        run: |
+          echo "🔍 Verifying deployment..."
+          sleep 15  # Give the container time to fully start
+          
+          # Check if container is running
+          if sudo docker ps | grep fastapi-backend-container; then
+            echo "✅ Container is running"
+          else
+            echo "❌ Container is not running"
+            sudo docker logs fastapi-backend-container
+            exit 1
+          fi
+          
+          # Check if application is responding
+          for i in {1..5}; do
+            if curl -f http://localhost:8000/ > /dev/null 2>&1; then
+              echo "✅ Application is responding"
+              break
+            else
+              echo "⏳ Waiting for application to respond (attempt $i/5)..."
+              sleep 10
+            fi
+            
+            if [ $i -eq 5 ]; then
+              echo "❌ Application is not responding after 5 attempts"
+              sudo docker logs fastapi-backend-container
+              exit 1
+            fi
+          done
+      
+      - name: Test key endpoints
+        run: |
+          echo "🧪 Testing key endpoints..."
+          
+          # Test main endpoints
+          endpoints=("/" "/test" "/try" "/work" "/testing" "/ansible" "/metrics")
+          
+          for endpoint in "${endpoints[@]}"; do
+            if curl -f "http://localhost:8000$endpoint" > /dev/null 2>&1; then
+              echo "✅ $endpoint is working"
+            else
+              echo "❌ $endpoint is not working"
+              exit 1
+            fi
+          done
+          
+          echo "✅ All endpoints are working correctly"
+      
+      - name: Clean up old images
+        run: |
+          echo "🧹 Cleaning up old Docker images..."
+          # Keep only the latest 3 images
+          sudo docker images sakthi1946/fastapi-backend --format "table {{.Repository}}\t{{.Tag}}\t{{.ID}}" | tail -n +2 | head -n -3 | awk '{print $3}' | xargs -r sudo docker rmi || true
+          echo "✅ Cleanup completed"
+      
+      - name: Send deployment notification
+        if: success()
+        run: |
+          echo "📢 Deployment completed successfully!"
+          echo "🔗 Application URL: http://localhost:8000"
+          echo "🐳 Container: fastapi-backend-container"
+          echo "🏷️ Image: sakthi1946/fastapi-backend:${{ steps.set-tag.outputs.IMAGE_TAG }}"
+
+  # Rollback job in case of failure
+  rollback:
+    if: failure()
+    needs: deploy-to-production
+    runs-on: self-hosted
+    
+    steps:
+      - name: Rollback to previous version
+        run: |
+          echo "🔄 Rolling back to previous version..."
+          
+          # Stop failed container
+          sudo docker stop fastapi-backend-container || true
+          sudo docker rm fastapi-backend-container || true
+          
+          # Get the previous image (second latest)
+          PREVIOUS_IMAGE=$(sudo docker images sakthi1946/fastapi-backend --format "{{.Repository}}:{{.Tag}}" | head -n 2 | tail -n 1)
+          
+          if [ -n "$PREVIOUS_IMAGE" ] && [ "$PREVIOUS_IMAGE" != "sakthi1946/fastapi-backend:<none>" ]; then
+            echo "🔄 Rolling back to: $PREVIOUS_IMAGE"
+            sudo docker run -d \
+              -p 8000:8000 \
+              --name fastapi-backend-container \
+              --restart unless-stopped \
+              --memory="512m" \
+              --cpus="1.0" \
+              -e ENVIRONMENT=production \
+              "$PREVIOUS_IMAGE"
+            
+            echo "✅ Rollback completed"
+          else
+            echo "❌ No previous image found for rollback"
+            exit 1
+          fi
